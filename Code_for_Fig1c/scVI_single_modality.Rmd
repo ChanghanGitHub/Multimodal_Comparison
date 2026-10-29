@@ -1,0 +1,225 @@
+---
+title: "scVI_single_modality"
+output: html_document
+date: "2026-10-28"
+---
+
+This script computes the single-modality scores for the MultiVI comparison in Fig. 1c. It follows the scvi-tools tutorial
+*"Integrating datasets with scVI in R"* (scvi_in_R; same steps and section order).
+
+* **RNA-only:** scVI on the raw RNA counts.
+* **ATAC-only:** scVI on the ArchR gene scores. These are the same gene-level ATAC features used for Incytr and MOFA; the data contain no raw gene-level ATAC counts.
+* Each model is trained separately for each PID (9, 12) on NK and CD8 T cells, with default settings, the same as the tutorial.
+* **Gene ranking:** the scVI differential expression between NK and CD8 T gives `scale1` and `scale2`, the mean scVI-normalized expression in NK and in CD8 T. NK genes are ranked by `scale1` and CD8 T genes by `scale2`. This fixes the old code, which ranked CD8 T genes by `scale1`.
+* **Combined ranking:** taken from MultiVI (`run_MultiVI_Gladstone.ipynb`, file `MultiVI_gene_scores_PID<pid>.csv`).
+
+Changes compared with the earlier `MultiVI_Gladstone.Rmd` (sections "RNA-only" / "ATAC only"):
+
+1. The RNA input is the raw counts (`main_layer = "counts"`, as in the tutorial) instead of log-normalized data. scVI models raw counts.
+2. CD8 T genes are ranked by `scale2` (bug fix).
+3. Results are converted to R objects before saving. The earlier `.rds` files stored Python pointers, which are empty in a new session.
+4. The scvi-tools random seed is set, and each trained model is saved.
+
+Output (in `MultiVI_output/`): `MultiVI_3score_comparison_scVIsingle.csv`. Its columns match the earlier `MultiVI_3score_comparison.csv`, so `STTT_RankingPlot.Rmd` can read it.
+
+# Setup
+
+```{r}
+library(Seurat)
+library(reticulate)
+library(Matrix)
+library(dplyr)
+library(data.table)
+```
+
+```{r}
+# same conda environment as run_MultiVI_Gladstone.ipynb (scvi-tools 1.5.1)
+use_condaenv("multivi", required = TRUE)
+
+scvi <- import("scvi", convert = FALSE)
+ad   <- import("anndata", convert = FALSE)
+sp   <- import("scipy.sparse", convert = FALSE)
+pd   <- import("pandas", convert = FALSE)
+
+scvi$settings$seed <- 0L   # scvi-tools seed (R's set.seed does not reach Python)
+py_config()
+```
+
+```{r}
+data_dir    <- "~/Research_2025/Gladstone/Data/"
+multivi_dir <- "~/Research_2025/Gladstone/MultiVI/MultiVI_output/"
+out_dir     <- "~/Research_2025/Gladstone/MultiVI/scVI_single_modality/"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+PID.use      <- c(9, 12)
+celltype_col <- "predicted.celltype.l1"
+
+# input layer for each modality
+input_layer <- c(RNA  = "counts",   # raw RNA counts
+                 ATAC = "data")     # ArchR gene scores (no raw gene-level ATAC counts exist)
+
+MAX_EPOCHS <- NULL   # NULL = scvi-tools default, as in the tutorial
+
+NK_panel <- c(
+  "CD57", "CD14", "CD25", "CD8", "CCR7", "PD1", "CD7", "TIM-3", "NKG2D", "TIGIT",
+  "NKG2C", "CD27", "NKp30", "CXCR6", "CD45RO", "CD69", "CD49a", "CXCR5", "CD127",
+  "KIR2DL1", "KIR3DL1", "DNAM-1", "NKG2A", "CD3", "CD38", "CD4", "CD56",
+  "HLA-DR", "CD16", "IFITM1", "IFIT1", "AIM2", "IFIT3", "SLFN11", "MX2", "pIRF3",
+  "MX1", "RIGI", "BRD4", "OAS1"
+)
+NK_signal  <- c("PTPRC", "HLA-DMB", "HLA-DMA", "HLA-DPB1", "HLA-G")
+CD8_signal <- c("SLFN11", "AIM2", "CCR7", "IFITM1", "CD7", "MX1", "TIGIT", "MX2", "CD38", "IFIT3",
+                "CXCR5", "BRD4", "CD14", "CD69", "MAPK14", "HNRNPD", "HNRNPH1", "YBX1", "FOS",
+                "SYNCRIP", "NFATC3", "RARA", "ITK", "NR3C1", "DDX5", "NPM1", "SLA2", "CD4")
+```
+
+# Loading and processing data with Seurat
+
+The RNA assay was log-normalized earlier (`NormalizeData`, LogNormalize, scale factor 10,000). scVI uses the raw counts in the `counts` layer.
+
+```{r}
+Data.input <- readRDS(paste0(data_dir, "Seurat_RNA_ATAC_CD8_NK.rds"))
+table(PID = Data.input$PID, cell_type = Data.input@meta.data[[celltype_col]])
+```
+
+# Converting Seurat object to AnnData
+
+This builds the AnnData directly with reticulate. It does the same job as `sceasy::convertFormat(..., main_layer = ...)` in the tutorial, but avoids sceasy's incompatibility with SeuratObject 5 (where `slot` is defunct).
+
+```{r}
+seurat_to_anndata <- function(seurat, assay, layer) {
+  mat <- GetAssayData(seurat, assay = assay, layer = layer)          # features x cells
+  X   <- sp$csr_matrix(r_to_py(as(Matrix::t(mat), "CsparseMatrix")))$astype("float32")
+  obs <- pd$DataFrame(dict(cell_type = as.character(seurat@meta.data[[celltype_col]]),
+                           PID       = as.character(seurat$PID)),
+                      index = colnames(seurat))
+  obs <- obs$rename(columns = dict(cell_type = celltype_col))
+  var <- pd$DataFrame(index = rownames(mat))
+  ad$AnnData(X = X, obs = obs, var = var)
+}
+```
+
+# Setup our AnnData for training, training, and differential expression
+
+These are the same calls as in the tutorial: `setup_anndata` → `SCVI` → `train` → `get_latent_representation` → `differential_expression`.
+
+```{r}
+run_scvi <- function(seurat, assay, model_dir) {
+  adata <- seurat_to_anndata(seurat, assay, input_layer[[assay]])
+
+  # setup our AnnData for training
+  scvi$model$SCVI$setup_anndata(adata)
+
+  # create and train the model
+  model <- scvi$model$SCVI(adata)
+  if (is.null(MAX_EPOCHS)) model$train() else model$train(max_epochs = as.integer(MAX_EPOCHS))
+  model$save(model_dir, overwrite = TRUE)
+
+  # latent representation (kept for the QC UMAP below)
+  latent <- py_to_r(model$get_latent_representation())
+  rownames(latent) <- colnames(seurat)
+
+  # differential expression NK vs CD8 T -> scale1 (NK) and scale2 (CD8 T)
+  DE <- model$differential_expression(adata, groupby = celltype_col,
+                                      group1 = "NK", group2 = "CD8 T")
+  de <- as.data.frame(py_to_r(DE$reset_index()$to_dict(orient = "list")))
+  names(de)[1] <- "gene"
+
+  list(de = de, latent = latent,
+       n_epochs = length(py_to_r(model$history[["elbo_train"]]$index$tolist())))
+}
+```
+
+```{r}
+single.list <- list()
+for (pid in PID.use) {
+  seurat <- subset(Data.input, subset = PID == pid)
+  for (assay in c("RNA", "ATAC")) {
+    message("PID ", pid, " - ", assay)
+    single.list[[as.character(pid)]][[assay]] <-
+      run_scvi(seurat, assay, model_dir = paste0(path.expand(out_dir), "scVI_", assay, "_PID", pid))
+  }
+}
+
+saveRDS(single.list, file = paste0(out_dir, "scVI_single_modality_PID_9_12.rds"))
+
+# genes and epochs per model
+do.call(rbind, lapply(names(single.list), function(p) do.call(rbind, lapply(names(single.list[[p]]), function(a)
+  data.frame(PID = p, modality = a, n_genes = nrow(single.list[[p]][[a]]$de),
+             n_epochs = single.list[[p]][[a]]$n_epochs)))))
+```
+
+# Gene rankings: single modality (scVI) and combined (MultiVI)
+
+```{r}
+rank_desc <- function(x) rank(-x, ties.method = "first", na.last = "keep")
+
+df.list <- list()
+for (pid in PID.use) {
+  mvi <- read.csv(paste0(multivi_dir, "MultiVI_gene_scores_PID", pid, ".csv"))
+
+  for (ct in c("NK", "CD8_T")) {
+    score_col <- if (ct == "NK") "scale1" else "scale2"   # group1 = NK, group2 = CD8 T
+    goi       <- if (ct == "NK") c(NK_panel, NK_signal) else CD8_signal
+
+    rna  <- single.list[[as.character(pid)]]$RNA$de
+    atac <- single.list[[as.character(pid)]]$ATAC$de
+    rna$rank  <- rank_desc(rna[[score_col]])
+    atac$rank <- rank_desc(atac[[score_col]])
+    comb <- mvi[mvi$cell_type == ct, ]
+
+    # full single-modality rankings (all genes); base R to avoid dplyr/plyr masking of rename()
+    single_ranks <- merge(
+      data.frame(gene = rna$gene,  score_rna  = rna[[score_col]],  rank_rna  = rna$rank),
+      data.frame(gene = atac$gene, score_atac = atac[[score_col]], rank_atac = atac$rank),
+      by = "gene", all = TRUE)
+    write.csv(single_ranks[order(single_ranks$rank_rna), ],
+              paste0(out_dir, "scVI_single_modality_ranks_PID", pid, "_", ct, ".csv"), row.names = FALSE)
+
+    comparison <- data.frame(
+      gene          = goi,
+      rank_rna      = rna$rank[match(goi, rna$gene)],
+      rank_atac     = atac$rank[match(goi, atac$gene)],
+      rank_combined = comb$rank_combined[match(goi, comb$gene)],
+      cell_type     = ct,
+      PID           = pid
+    )
+    df.list[[paste(pid, ct)]] <- comparison[order(comparison$rank_combined), ]
+  }
+}
+
+comparison_all <- rbindlist(df.list)
+write.csv(comparison_all, file = paste0(multivi_dir, "MultiVI_3score_comparison_scVIsingle.csv"))
+
+comparison_all %>%
+  dplyr::filter(cell_type == "CD8_T",
+                gene %in% c("CD4", "MX1", "MX2", "IFIT3", "SLFN11", "IFITM1", "BRD4", "AIM2"))
+```
+
+# Getting the latent representation and visualization (QC)
+
+This is a sanity check, as in the tutorial: NK and CD8 T cells should separate in each scVI latent space.
+
+```{r, fig.width = 10, fig.height = 8}
+plots <- list()
+for (pid in PID.use) {
+  seurat <- subset(Data.input, subset = PID == pid)
+  for (assay in c("RNA", "ATAC")) {
+    latent <- single.list[[as.character(pid)]][[assay]]$latent
+    seurat[["scvi"]] <- CreateDimReducObject(embeddings = latent[colnames(seurat), ],
+                                             key = "scvi_", assay = assay)
+    seurat <- RunUMAP(seurat, reduction = "scvi", dims = 1:ncol(latent), verbose = FALSE)
+    plots[[paste(pid, assay)]] <- DimPlot(seurat, reduction = "umap", group.by = celltype_col) +
+      ggplot2::ggtitle(paste0("PID ", pid, " - scVI ", assay))
+  }
+}
+patchwork::wrap_plots(plots, ncol = 2)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+py_config()
+py_to_r(scvi$`__version__`)
+```
