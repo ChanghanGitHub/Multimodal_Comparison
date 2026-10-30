@@ -1,0 +1,250 @@
+---
+title: "scVI_RNA_GeneScore"
+output: html_document
+date: "2026-10-29"
+---
+
+Single-modality and multimodal gene scores for Fig. 1c. All three models are scVI and use **the same two input matrices**:
+
+* **RNA:** raw RNA counts of all 33,258 genes.
+* **ATAC:** ArchR gene scores rounded to integers. They are pseudo-counts, scaled to 10,000 per cell by ArchR. The matrix is aligned to the same 33,258 genes; genes without an ArchR gene score (not in the ArchR gene annotation) are set to 0.
+
+# Setup
+
+```{r}
+library(Seurat)
+library(reticulate)
+library(Matrix)
+library(dplyr)
+library(data.table)
+```
+
+```{r}
+use_condaenv("multivi", conda = "C:/Users/chang/miniconda3_2/Scripts/conda.exe")
+
+scvi <- import("scvi", convert = FALSE)
+ad   <- import("anndata", convert = FALSE)
+sp   <- import("scipy.sparse", convert = FALSE)
+pd   <- import("pandas", convert = FALSE)
+
+scvi$settings$seed <- 0L   # scvi-tools seed (R's set.seed does not reach Python)
+py_config()
+```
+
+```{r}
+data_dir <- "~/Research_2025/Gladstone/Data/"
+out_dir  <- "~/Research_2025/Gladstone/MultiVI/scVI_RNA_GeneScore/"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+PID.use      <- c(9, 12)
+celltype_col <- "predicted.celltype.l1"
+N_TOP        <- 10000
+LIKELIHOOD   <- "nb"
+MAX_EPOCHS   <- NULL   # NULL = scvi-tools default, as in the tutorials
+
+NK_panel <- c(
+  "CD57", "CD14", "CD25", "CD8", "CCR7", "PD1", "CD7", "TIM-3", "NKG2D", "TIGIT",
+  "NKG2C", "CD27", "NKp30", "CXCR6", "CD45RO", "CD69", "CD49a", "CXCR5", "CD127",
+  "KIR2DL1", "KIR3DL1", "DNAM-1", "NKG2A", "CD3", "CD38", "CD4", "CD56",
+  "HLA-DR", "CD16", "IFITM1", "IFIT1", "AIM2", "IFIT3", "SLFN11", "MX2", "pIRF3",
+  "MX1", "RIGI", "BRD4", "OAS1"
+)
+NK_signal  <- c("PTPRC", "HLA-DMB", "HLA-DMA", "HLA-DPB1", "HLA-G")
+CD8_signal <- c("SLFN11", "AIM2", "CCR7", "IFITM1", "CD7", "MX1", "TIGIT", "MX2", "CD38", "IFIT3",
+                "CXCR5", "BRD4", "CD14", "CD69", "MAPK14", "HNRNPD", "HNRNPH1", "YBX1", "FOS",
+                "SYNCRIP", "NFATC3", "RARA", "ITK", "NR3C1", "DDX5", "NPM1", "SLA2", "CD4")
+```
+
+# Loading data with Seurat
+
+The object holds the RNA counts (assay `RNA`) and the ArchR gene scores (assay `ATAC`) of the same cells.
+
+```{r}
+Data.input <- readRDS(paste0(data_dir, "Seurat_RNA_ATAC_CD8_NK.rds"))
+table(PID = Data.input$PID, cell_type = Data.input@meta.data[[celltype_col]])
+```
+
+# Input matrices (identical for the three models)
+
+```{r}
+# RNA: raw counts, all genes (genes x cells)
+rna_matrix <- function(seurat) {
+  GetAssayData(seurat, assay = "RNA", layer = "counts")
+}
+
+# ATAC: ArchR gene scores rounded to integer pseudo-counts, aligned to the RNA genes (missing genes = 0)
+atac_matrix <- function(seurat, genes) {
+  gs <- GetAssayData(seurat, assay = "ATAC", layer = "data")
+  gs <- as(gs, "CsparseMatrix")
+  gs@x <- round(gs@x)
+  gs <- drop0(gs)
+  shared  <- intersect(genes, rownames(gs))
+  missing <- setdiff(genes, rownames(gs))
+  empty   <- Matrix(0, nrow = length(missing), ncol = ncol(gs), sparse = TRUE,
+                    dimnames = list(missing, colnames(gs)))
+  rbind(gs[shared, , drop = FALSE], empty)[genes, ]
+}
+```
+
+# Converting to AnnData
+
+```{r}
+# mat: genes x cells; obs_df: data.frame with one row per cell (rownames = cell names)
+to_anndata <- function(mat, obs_df) {
+  X   <- sp$csr_matrix(r_to_py(as(Matrix::t(mat), "CsparseMatrix")))$astype("float32")
+  obs <- pd$DataFrame(r_to_py(lapply(obs_df, as.character)), index = rownames(obs_df))
+  var <- pd$DataFrame(index = rownames(mat))
+  ad$AnnData(X = X, obs = obs, var = var)
+}
+```
+
+# Setup, training and differential expression
+
+
+```{r}
+run_scvi <- function(adata, model_dir, batch_key = NULL) {
+  if (is.null(batch_key)) {
+    scvi$model$SCVI$setup_anndata(adata)
+    model <- scvi$model$SCVI(adata, gene_likelihood = LIKELIHOOD)
+  } else {
+    scvi$model$SCVI$setup_anndata(adata, batch_key = batch_key)
+    model <- scvi$model$SCVI(adata, gene_likelihood = LIKELIHOOD, dispersion = "gene-batch")
+  }
+  if (is.null(MAX_EPOCHS)) model$train() else model$train(max_epochs = as.integer(MAX_EPOCHS))
+  model$save(model_dir, overwrite = TRUE)
+
+  latent <- py_to_r(model$get_latent_representation())
+  rownames(latent) <- py_to_r(adata$obs_names$tolist())
+
+  # NK vs CD8 T: scale1 = mean normalized expression in NK, scale2 = in CD8 T
+  DE <- model$differential_expression(adata, groupby = "cell_type", group1 = "NK", group2 = "CD8 T")
+  de <- as.data.frame(py_to_r(DE$reset_index()$to_dict(orient = "list")))
+  names(de)[1] <- "gene"
+
+  list(de = de, latent = latent,
+       n_epochs = length(py_to_r(model$history[["elbo_train"]]$index$tolist())))
+}
+```
+
+
+```{r}
+res.list <- list()
+
+for (pid in PID.use) {
+  seurat <- subset(Data.input, subset = PID == pid)
+  cells  <- colnames(seurat)
+  meta   <- data.frame(cell_type = seurat@meta.data[[celltype_col]], PID = pid, row.names = cells)
+
+  rna  <- rna_matrix(seurat)
+  atac <- atac_matrix(seurat, rownames(rna))
+  stopifnot(identical(rownames(rna), rownames(atac)), identical(colnames(rna), colnames(atac)))
+  message("PID ", pid, ": ", nrow(rna), " genes, ", ncol(rna), " cells; ",
+          sum(Matrix::rowSums(atac) > 0), " genes with ATAC signal")
+
+  base <- paste0(path.expand(out_dir), "PID", pid, "_")
+
+  # single modality
+  res_rna  <- run_scvi(to_anndata(rna,  meta), paste0(base, "scVI_RNA"))
+  res_atac <- run_scvi(to_anndata(atac, meta), paste0(base, "scVI_ATAC"))
+
+  # multimodal: same two matrices stacked by cell, modality as batch
+  meta_both <- rbind(
+    data.frame(meta, modality = "RNA",  row.names = paste0(cells, "_RNA")),
+    data.frame(meta, modality = "ATAC", row.names = paste0(cells, "_ATAC"))
+  )
+  both <- cbind(rna, atac)
+  colnames(both) <- rownames(meta_both)
+  res_both <- run_scvi(to_anndata(both, meta_both), paste0(base, "scVI_multimodal"),
+                       batch_key = "modality")
+
+  res.list[[as.character(pid)]] <- list(RNA = res_rna, ATAC = res_atac, Multimodal = res_both,
+                                        meta = meta, meta_both = meta_both)
+}
+
+saveRDS(res.list, file = paste0(out_dir, "scVI_RNA_GeneScore_PID_9_12.rds"))
+
+# genes and epochs per model
+do.call(rbind, lapply(names(res.list), function(p) do.call(rbind, lapply(c("RNA", "ATAC", "Multimodal"), function(m)
+  data.frame(PID = p, model = m, n_genes = nrow(res.list[[p]][[m]]$de),
+             n_epochs = res.list[[p]][[m]]$n_epochs)))))
+```
+
+# Gene rankings (all 33,258 genes)
+
+```{r}
+rank_desc <- function(x) rank(-x, ties.method = "first", na.last = "keep")
+
+df.list <- list()
+for (pid in PID.use) {
+  r <- res.list[[as.character(pid)]]
+
+  for (ct in c("NK", "CD8_T")) {
+    score_col <- if (ct == "NK") "scale1" else "scale2"   # group1 = NK, group2 = CD8 T
+    goi       <- if (ct == "NK") c(NK_panel, NK_signal) else CD8_signal
+
+    scores <- Reduce(function(a, b) merge(a, b, by = "gene", all = TRUE), list(
+      data.frame(gene = r$RNA$de$gene,        score_rna      = r$RNA$de[[score_col]]),
+      data.frame(gene = r$ATAC$de$gene,       score_atac     = r$ATAC$de[[score_col]]),
+      data.frame(gene = r$Multimodal$de$gene, score_combined = r$Multimodal$de[[score_col]])
+    ))
+    scores$rank_rna      <- rank_desc(scores$score_rna)
+    scores$rank_atac     <- rank_desc(scores$score_atac)
+    scores$rank_combined <- rank_desc(scores$score_combined)
+    scores <- scores[order(scores$rank_combined), ]
+
+    # full rankings, and top-N genes (multimodal score) for Incytr
+    write.csv(scores, paste0(out_dir, "scVI_gene_scores_PID", pid, "_", ct, ".csv"), row.names = FALSE)
+    write.csv(head(scores[, c("gene", "rank_combined", "score_combined")], N_TOP),
+              paste0(out_dir, "scVI_top", N_TOP, "_PID", pid, "_", ct, ".csv"), row.names = FALSE)
+
+    comparison <- data.frame(
+      gene          = goi,
+      rank_rna      = scores$rank_rna[match(goi, scores$gene)],
+      rank_atac     = scores$rank_atac[match(goi, scores$gene)],
+      rank_combined = scores$rank_combined[match(goi, scores$gene)],
+      cell_type     = ct,
+      PID           = pid
+    )
+    df.list[[paste(pid, ct)]] <- comparison[order(comparison$rank_combined), ]
+  }
+}
+
+comparison_all <- rbindlist(df.list)
+write.csv(comparison_all, file = paste0(out_dir, "scVI_3score_comparison.csv"))
+
+comparison_all %>%
+  dplyr::filter(gene %in% c("CD4", "MX1", "MX2", "IFIT3", "SLFN11", "IFITM1", "BRD4", "AIM2",
+                            "PTPRC", "HLA-DMB", "HLA-DMA", "HLA-DPB1", "HLA-G"))
+```
+
+# Getting the latent representation and visualization (QC)
+
+This is a sanity check, as in the tutorials. In the single-modality models, NK and CD8 T should separate. In the multimodal model, RNA and ATAC profiles of the same cell type should overlap.
+
+```{r, fig.width = 12, fig.height = 12}
+plots <- list()
+for (pid in PID.use) {
+  r <- res.list[[as.character(pid)]]
+  for (m in c("RNA", "ATAC", "Multimodal")) {
+    meta_m <- if (m == "Multimodal") r$meta_both else r$meta
+    latent <- r[[m]]$latent[rownames(meta_m), ]
+    so <- CreateSeuratObject(counts = Matrix(0, nrow = 2, ncol = nrow(meta_m), sparse = TRUE,
+                                             dimnames = list(c("g1", "g2"), rownames(meta_m))),
+                             meta.data = meta_m)
+    so[["scvi"]] <- CreateDimReducObject(embeddings = latent, key = "scvi_", assay = "RNA")
+    so <- RunUMAP(so, reduction = "scvi", dims = 1:ncol(latent), verbose = FALSE)
+    plots[[paste(pid, m)]] <- DimPlot(so, reduction = "umap", group.by = "cell_type",
+                                      shape.by = if (m == "Multimodal") "modality" else NULL) +
+      ggplot2::ggtitle(paste0("PID ", pid, " - scVI ", m))
+  }
+}
+patchwork::wrap_plots(plots, ncol = 3)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+py_config()
+py_to_r(scvi$`__version__`)
+```
